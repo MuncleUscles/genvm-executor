@@ -1250,6 +1250,123 @@ async fn appealed_child_open_bucket_charges_primary_and_subtree_budget_per_emiss
 }
 
 #[tokio::test]
+async fn nested_child_budget_charges_once_per_parent_appeal_opportunity() {
+    const PARENT_APPEALS: u64 = 2;
+    const CHILD_APPEALS: u64 = 1;
+
+    let (buckets, fees, gas_data) = production_emission_fee_model(U256::MAX);
+    let quote = rt::fees::DataLimit::new(buckets, fees, gas_data).unwrap();
+    let mut child_params = appealed_child_params();
+    child_params.rotations.truncate(CHILD_APPEALS as usize + 1);
+    let child_primary = quote
+        .calculate_message_fee_internal(&child_params)
+        .unwrap()
+        .reported_fee();
+    assert_eq!(child_primary, U256::from(3_079));
+    let mut grandchild_params = child_params.clone();
+    grandchild_params.rotations.truncate(1);
+    let grandchild_primary = quote
+        .calculate_message_fee_internal(&grandchild_params)
+        .unwrap()
+        .reported_fee();
+    assert_eq!(grandchild_primary, U256::from(529));
+
+    // The VM receives the already-recursive descendant reserve and treats
+    // the matching subtree as opaque. The child reserves one acceptance
+    // grandchild for each of its own opportunities and one finalization
+    // grandchild. Only the parent repeats that complete child budget across
+    // its own acceptance opportunities.
+    let child_descendants = grandchild_primary * (CHILD_APPEALS + 2);
+    let full_child_budget = child_primary + child_descendants;
+    let parent_budget = full_child_budget * (PARENT_APPEALS + 1);
+    assert_eq!(full_child_budget, U256::from(4_666));
+    assert_eq!(parent_budget, U256::from(13_998));
+
+    // Each loop emits three fresh occurrences in one execution. It models
+    // the parent's capacity horizon, not a replay of an accepted occurrence.
+    for pinned in [true, false] {
+        let (buckets, fees, gas_data) = production_emission_fee_model(parent_budget);
+        let mut test = EmissionTestContext::with_fee_model(u32::MAX, buckets, fees, gas_data);
+        let node = &mut test.context.data.accumulator.message_fee_allocation[1];
+        node.fee_params = genvm_modules_interfaces::fees::MessageAllocationNodeParams::Internal(
+            Arc::new(genvm_modules_interfaces::fees::InternalMessageParams {
+                leader_timeunits_allocation: child_params.leader_time_units_allocation,
+                validator_timeunits_allocation: child_params.validator_time_units_allocation,
+                execution_budget_per_round: child_params.execution_budget_per_round,
+                rotations: child_params.rotations.clone(),
+                max_price_gen_per_time_unit: child_params.max_price_gen_per_time_unit,
+                storage_fee_max_gas_price: child_params.storage_fee_max_gas_price,
+                receipt_fee_max_gas_price: child_params.receipt_fee_max_gas_price,
+            }),
+        );
+        node.budget = pinned.then_some(parent_budget);
+        node.on = genvm_modules_interfaces::On::Decided;
+        node.children_budget = child_descendants;
+        node.subtree = bytes::Bytes::from_static(b"acceptance and finalization grandchildren");
+
+        for occurrence in 1..=PARENT_APPEALS + 1 {
+            test.emit_internal_allocation_on(gl_call::On::Decided)
+                .await
+                .unwrap();
+            match &test.context.data.accumulator.emissions[occurrence as usize - 1] {
+                domain::ExecutionEmission::InternalMessage {
+                    message_fee,
+                    subtree,
+                    use_balance,
+                    ..
+                } => {
+                    assert_eq!(*message_fee, full_child_budget, "pinned={pinned}");
+                    assert_eq!(
+                        subtree,
+                        b"acceptance and finalization grandchildren".as_slice()
+                    );
+                    assert!(!*use_balance);
+                }
+                other => panic!("unexpected emission: {other:?}"),
+            }
+            assert_eq!(
+                test.context
+                    .data
+                    .accumulator
+                    .message_fee_allocation_consumed[1],
+                full_child_budget * occurrence,
+                "pinned={pinned}"
+            );
+        }
+
+        let error = trap_message(
+            test.emit_internal_allocation_on(gl_call::On::Decided)
+                .await
+                .unwrap_err(),
+        );
+        let exhausted = if pinned {
+            "out_of message_fee allocation_budget # internal"
+        } else {
+            "out_of message_fee total # internal"
+        };
+        assert!(error.contains(exhausted), "pinned={pinned}: {error}");
+        assert_eq!(test.context.data.accumulator.emissions.len(), 3);
+        assert_eq!(
+            test.context
+                .data
+                .accumulator
+                .message_fee_allocation_consumed[1],
+            parent_budget
+        );
+        let consumed = test
+            .context
+            .data
+            .supervisor
+            .shared_data
+            .data_fees_limit
+            .consumed()
+            .await;
+        assert_eq!(consumed.message_fee, parent_budget);
+        test.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn allocation_zero_price_caps_reject_calls_and_deploys_without_charging() {
     for emission in [
         MessageEmission::InternalAllocation,
